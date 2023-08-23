@@ -43,8 +43,8 @@ struct LineSeparator {
 }
 struct CrossSeparator {
     related_line_seperators: Vec<LineSeparator>,
-    separator: Rect,
     interact_rect: Rect,
+    snapping_rect: Rect,
 }
 
 // Builder
@@ -209,7 +209,7 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
         }
 
         // Finally draw cross section seperators
-        self.show_cross_section_seperators(ui, separators);
+        self.show_cross_section_separators(ui, separators);
 
         for index in self.to_remove.iter().copied().rev() {
             self.tree.remove_tab(index);
@@ -370,58 +370,72 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
         return separators;
     }
 
-    fn show_cross_section_seperators(&mut self, ui: &mut Ui, mut separators: Vec<LineSeparator>){
+    fn show_cross_section_separators(&mut self, ui: &mut Ui, separators: Vec<LineSeparator>){
         let style = self.style.as_ref().unwrap();
         let mut cross_section_seperators: Vec<CrossSeparator> = vec![];
 
         // detect overlapping line separators
-        for (index, line_separator) in separators.iter().enumerate() {
-            let mut index_compare = index + 1;
-            let current_rect = line_separator.interact_rect;
-            while index_compare < separators.len() {
-                let rect = separators[index_compare].interact_rect;
-                if current_rect.intersects(rect) {
-                    let related_line_seperators = vec!(*line_separator, separators[index_compare]);
-                    let separator = current_rect.intersect(separators[index_compare].interact_rect);
-                    let mut expand = Vec2::ZERO;
-                    expand.x += style.separator.extra_interact_width / 2.0;
-                    expand.y += style.separator.extra_interact_width / 2.0;
-                    let interact_rect = separator.expand2(expand);
-                    let cross_separator = CrossSeparator {
-                        related_line_seperators: related_line_seperators,
-                        separator: separator,
-                        interact_rect: interact_rect,
-                    };
-                    cross_section_seperators.push(cross_separator);
-                }
-                index_compare = index_compare + 1;
+        for (i, sep1) in separators.iter().enumerate() {
+            for sep2 in separators[i+1..].iter() {
+                let separator = sep1.interact_rect.intersect(sep2.interact_rect);
+                let interact_rect = separator.expand(style.separator.extra_interact_width / 2.0);
+                let snapping_rect = interact_rect.expand(style.separator.extra_interact_width * 10.0);
+                let cross_separator = CrossSeparator {
+                    related_line_seperators: vec![*sep1, *sep2],
+                    interact_rect,
+                    snapping_rect,
+                };
+                cross_section_seperators.push(cross_separator);
             }
         }
+
+        // for i in 0..cross_section_seperators.len() {
+        //     for j in 0..cross_section_seperators.len() {
+        //         if i != j && cross_section_seperators[i].interact_rect.intersects(cross_section_seperators[j].interact_rect) {
+        //             let slice_i = cross_section_seperators[i].related_line_seperators.clone();
+        //             let slice_j = cross_section_seperators[j].related_line_seperators.clone();
+        //             cross_section_seperators[i].related_line_seperators.extend_from_slice(slice_j.as_slice());
+        //             cross_section_seperators[j].related_line_seperators.extend_from_slice(slice_i.as_slice());
+        //         }
+        //     }
+        // }
 
         for i in 0..cross_section_seperators.len() {
-            for j in 0..cross_section_seperators.len() {
-                if i != j && cross_section_seperators[i].interact_rect.intersects(cross_section_seperators[j].interact_rect) {
-                    let slice_i = cross_section_seperators[i].related_line_seperators.clone();
-                    let slice_j = cross_section_seperators[j].related_line_seperators.clone();
-                    cross_section_seperators[i].related_line_seperators.extend_from_slice(slice_j.as_slice());
-                    cross_section_seperators[j].related_line_seperators.extend_from_slice(slice_i.as_slice());
-                }
-            }
-        }
-
-        for separator in cross_section_seperators {
-            let response = ui.allocate_rect(separator.interact_rect, Sense::click_and_drag())
+            let separator = &cross_section_seperators[i];
+            let response = ui.allocate_rect(cross_section_seperators[i].interact_rect, Sense::click_and_drag())
                 .on_hover_and_drag_cursor(CursorIcon::Move);
 
-            let color = if response.dragged() {
-                style.separator.color_dragged
-            } else if response.hovered() {
-                style.separator.color_hovered
-            } else {
-                style.separator.color_idle
-            };
+            // snapping to nearby cross separators
+            // let mut snapping_position: Option<Vec2> = None;
+            // if response.dragged(){
+            //     for j in 0..cross_section_seperators.len() {
+            //         if i != j && cross_section_seperators[i].snapping_rect.intersects(cross_section_seperators[j].snapping_rect) {
+            //             snapping_position = Some(cross_section_seperators[j].related_line_seperators[0].separator.center().to_vec2());
+            //             break;
+            //         }
+            //     }
+            // }
 
+            let mut snapping_position: Option<Vec2> = None;
+            if response.dragged(){
+                for j in 0..cross_section_seperators.len() {
+                    if i != j && cross_section_seperators[j].snapping_rect.contains(response.interact_pointer_pos().unwrap() + response.drag_delta()) {
+                        snapping_position = Some(cross_section_seperators[j].interact_rect.center().to_vec2());
+                        break;
+                    }
+                }
+            }
+
+            // highlight all affected line separators
             if response.dragged() || response.hovered() {
+                let color = if response.dragged() {
+                    style.separator.color_dragged
+                } else if response.hovered() {
+                    style.separator.color_hovered
+                } else {
+                    style.separator.color_idle
+                };
+
                 for line_separator in separator.related_line_seperators.iter() {
                     ui.painter().rect_filled(line_separator.separator, Rounding::none(), color);   
                 }
@@ -442,7 +456,12 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
                         // shrunk fast.
                         if let Some(pos) = response.interact_pointer_pos() {
                             let dim_point = pos.dim_point;
-                            let delta = response.drag_delta().dim_point;
+                            let delta = if snapping_position.is_some() {
+                                (snapping_position.unwrap() - pos.to_vec2()).dim_point
+                            }
+                            else {
+                                response.drag_delta().dim_point
+                            };
         
                             if (delta > 0. && dim_point > midpoint && dim_point < rect.max.dim_point)
                                 || (delta < 0. && dim_point < midpoint && dim_point > rect.min.dim_point)
