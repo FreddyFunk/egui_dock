@@ -35,6 +35,17 @@ pub struct DockArea<'tree, Tab> {
     new_focused: Option<NodeIndex>,
     tab_hover_rect: Option<(Rect, TabIndex)>,
 }
+#[derive(Copy, Clone)]
+struct LineSeparator {
+    node_index: NodeIndex,
+    separator: Rect,
+    interact_rect: Rect,
+}
+struct CrossSeparator {
+    related_line_seperators: Vec<LineSeparator>,
+    separator: Rect,
+    interact_rect: Rect,
+}
 
 // Builder
 impl<'tree, Tab> DockArea<'tree, Tab> {
@@ -190,11 +201,15 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
 
         // Finaly draw separators so that their "interaction zone" is above
         // bodies (see `SeparatorStyle::extra_interact_width`).
+        let mut separators: Vec<LineSeparator> = vec![];
         for node_index in self.tree.breadth_first_index_iter() {
             if self.tree[node_index].is_parent() {
-                self.show_separator(ui, node_index);
+                separators.append(&mut self.show_separator(ui, node_index));
             }
         }
+
+        // Finally draw cross section seperators
+        self.show_cross_section_seperators(ui, separators);
 
         for index in self.to_remove.iter().copied().rev() {
             self.tree.remove_tab(index);
@@ -281,12 +296,13 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
         }
     }
 
-    fn show_separator(&mut self, ui: &mut Ui, node_index: NodeIndex) {
+    fn show_separator(&mut self, ui: &mut Ui, node_index: NodeIndex) -> Vec<LineSeparator> {
         assert!(self.tree[node_index].is_parent());
 
         let style = self.style.as_ref().unwrap();
         let pixels_per_point = ui.ctx().pixels_per_point();
 
+        let mut separators: Vec<LineSeparator> = vec![];
         duplicate! {
             [
                 orientation   dim_point  dim_size;
@@ -303,6 +319,8 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
                 let mut expand = Vec2::ZERO;
                 expand.dim_point += style.separator.extra_interact_width / 2.0;
                 let interact_rect = separator.expand2(expand);
+
+                separators.push(LineSeparator { node_index: node_index, separator: separator, interact_rect: interact_rect });
 
                 let response = ui.allocate_rect(interact_rect, Sense::click_and_drag())
                     .on_hover_and_drag_cursor(paste!{ CursorIcon::[<Resize orientation>]});
@@ -348,6 +366,99 @@ impl<'tree, Tab> DockArea<'tree, Tab> {
                 }
             }
         }
+
+        return separators;
+    }
+
+    fn show_cross_section_seperators(&mut self, ui: &mut Ui, mut separators: Vec<LineSeparator>){
+        let style = self.style.as_ref().unwrap();
+        let mut cross_section_seperators: Vec<CrossSeparator> = vec![];
+
+        // detect overlapping line separators
+        for (index, line_separator) in separators.iter().enumerate() {
+            let mut index_compare = index + 1;
+            let current_rect = line_separator.interact_rect;
+            while index_compare < separators.len() {
+                let rect = separators[index_compare].interact_rect;
+                if current_rect.intersects(rect) {
+                    let related_line_seperators = vec!(*line_separator, separators[index_compare]);
+                    let separator = current_rect.intersect(separators[index_compare].interact_rect);
+                    let mut expand = Vec2::ZERO;
+                    expand.x += style.separator.extra_interact_width / 2.0;
+                    expand.y += style.separator.extra_interact_width / 2.0;
+                    let interact_rect = separator.expand2(expand);
+                    let cross_separator = CrossSeparator {
+                        related_line_seperators: related_line_seperators,
+                        separator: separator,
+                        interact_rect: interact_rect,
+                    };
+                    cross_section_seperators.push(cross_separator);
+                }
+                index_compare = index_compare + 1;
+            }
+        }
+
+        for i in 0..cross_section_seperators.len() {
+            for j in 0..cross_section_seperators.len() {
+                if i != j && cross_section_seperators[i].interact_rect.intersects(cross_section_seperators[j].interact_rect) {
+                    let slice_i = cross_section_seperators[i].related_line_seperators.clone();
+                    let slice_j = cross_section_seperators[j].related_line_seperators.clone();
+                    cross_section_seperators[i].related_line_seperators.extend_from_slice(slice_j.as_slice());
+                    cross_section_seperators[j].related_line_seperators.extend_from_slice(slice_i.as_slice());
+                }
+            }
+        }
+
+        for separator in cross_section_seperators {
+            let response = ui.allocate_rect(separator.interact_rect, Sense::click_and_drag())
+                .on_hover_and_drag_cursor(CursorIcon::Move);
+
+            let color = if response.dragged() {
+                style.separator.color_dragged
+            } else if response.hovered() {
+                style.separator.color_hovered
+            } else {
+                style.separator.color_idle
+            };
+
+            if response.dragged() || response.hovered() {
+                for line_separator in separator.related_line_seperators.iter() {
+                    ui.painter().rect_filled(line_separator.separator, Rounding::none(), color);   
+                }
+            }
+
+            for line_separator in separator.related_line_seperators.iter()  {
+                duplicate! {
+                    [
+                        orientation   dim_point  dim_size;
+                        [Horizontal]  [x]        [width] ;
+                        [Vertical]    [y]        [height];
+                    ]
+                    if let Node::orientation { fraction, ref rect } = &mut self.tree[line_separator.node_index] {        
+                        let midpoint = rect.min.dim_point + rect.dim_size() * *fraction;
+        
+                        // Update 'fraction' interaction after drawing seperator,
+                        // overwise it may overlap on other separator / bodies when
+                        // shrunk fast.
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let dim_point = pos.dim_point;
+                            let delta = response.drag_delta().dim_point;
+        
+                            if (delta > 0. && dim_point > midpoint && dim_point < rect.max.dim_point)
+                                || (delta < 0. && dim_point < midpoint && dim_point > rect.min.dim_point)
+                            {
+                                let range = rect.max.dim_point - rect.min.dim_point;
+                                let min = (style.separator.extra / range).min(1.0);
+                                let max = 1.0 - min;
+                                let (min, max) = (min.min(max), max.max(min));
+                                *fraction = (*fraction + delta / range).clamp(min, max);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
     }
 
     fn show_leaf(
